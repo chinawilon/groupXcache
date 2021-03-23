@@ -5,11 +5,13 @@ import (
 	"errors"
 	pb "groupXcache/groupXcachepb"
 	"groupXcache/lru"
+	"groupXcache/singleflight"
 	"math/rand"
 	"strconv"
 	"sync"
 	"sync/atomic"
 )
+
 
 type CacheStats struct {
 	Bytes int64
@@ -129,12 +131,15 @@ type flightGroup interface {
 	Do(key string, fn func()(interface{}, error)) (interface{}, error)
 }
 
-type PeerPicker interface {
-	PickPeer(key string) (peer ProtoGetter, ok bool)
-}
-
 type Getter interface {
 	Get(ctx context.Context, key string, dest Sink) error
+}
+
+// A GetterFunc implements Getter with a function.
+type GetterFunc func(ctx context.Context, key string, dest Sink) error
+
+func (f GetterFunc) Get(ctx context.Context, key string, dest Sink) error {
+	return f(ctx, key, dest)
 }
 
 type Group struct {
@@ -149,6 +154,73 @@ type Group struct {
 	mainCache cache
 	hotCache cache
 	loadGroup flightGroup
+}
+
+var (
+	mu sync.RWMutex
+	groups = make(map[string]*Group)
+	initPeerServerOnce sync.Once
+	initPeerServer func()
+)
+
+func GetGroup(name string) *Group {
+	mu.RLock()
+	g := groups[name]
+	mu.RUnlock()
+	return g
+}
+
+
+var newGroupHook func(*Group)
+
+func RegisterNewGroupHook(fn func(*Group)) {
+	if newGroupHook != nil {
+		panic("RegisterNewGroupHook called more than once")
+	}
+	newGroupHook = fn
+}
+
+// RegisterServerStart registers a hook that is run when the first
+// group is created.
+func RegisterServerStart(fn func()) {
+	if initPeerServer != nil {
+		panic("RegisterServerStart called more than once")
+	}
+	initPeerServer = fn
+}
+
+func callInitPeerServer() {
+	if initPeerServer != nil {
+		initPeerServer()
+	}
+}
+
+func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
+	return newGroup(name, cacheBytes, getter, nil)
+}
+
+func newGroup(name string, cacheByte int64, getter Getter, peers PeerPicker) *Group {
+	if getter == nil {
+		panic("ini Getter")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	initPeerServerOnce.Do(callInitPeerServer)
+	if _, dup := groups[name]; dup {
+		panic("duplicate registration of group " + name)
+	}
+	g := &Group{
+		name: name,
+		getter: getter,
+		peers: peers,
+		cacheBytes: cacheByte,
+		loadGroup: &singleflight.Group{},
+	}
+	if fn := newGroupHook; fn != nil {
+		fn(g)
+	}
+	groups[name] = g
+	return g
 }
 
 func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
