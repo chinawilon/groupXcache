@@ -1,0 +1,18 @@
+syntax = "proto2";
+
+package groupXcachepb;
+
+message GetRequest {
+  required string group = 1;
+  required string key = 2; // not actually required/guaranteed to be UTF-8
+}
+
+message GetResponse {
+  optional bytes value = 1;
+  optional double minute_qps = 2;
+}
+
+service GroupCache {
+  rpc Get(GetRequest) returns (GetResponse) {
+  };
+}
